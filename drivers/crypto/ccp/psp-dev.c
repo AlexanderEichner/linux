@@ -24,6 +24,11 @@
 #include <linux/ccp.h>
 #include <linux/firmware.h>
 
+#include <asm/amd_nb.h>
+
+#define IN_LINUX
+#include <linux/psp-stub.h>
+
 #include "sp-dev.h"
 #include "psp-dev.h"
 
@@ -46,6 +51,10 @@ MODULE_PARM_DESC(psp_cmd_timeout, " default timeout value, in seconds, for PSP c
 static int psp_probe_timeout = 5;
 module_param(psp_probe_timeout, int, 0644);
 MODULE_PARM_DESC(psp_probe_timeout, " default timeout value, in seconds, during PSP device probe");
+
+static int psp_emu_enabled = 0;
+module_param(psp_emu_enabled, int, 0644);
+MODULE_PARM_DESC(psp_emu_enabled, " flag whether the emulated PSP should be used (requires the PSP emulator running with SEV app in userspace)");
 
 static bool psp_dead;
 static int psp_timeout;
@@ -149,9 +158,47 @@ static int sev_cmd_buffer_len(int cmd)
 	case SEV_CMD_LAUNCH_UPDATE_SECRET:	return sizeof(struct sev_data_launch_secret);
 	case SEV_CMD_DOWNLOAD_FIRMWARE:		return sizeof(struct sev_data_download_firmware);
 	case SEV_CMD_GET_ID:			return sizeof(struct sev_data_get_id);
+	case PSP_STUB_LOAD_BIN:			return sizeof(PSPSTUBREQLOADBIN);
+	case PSP_STUB_EXEC_BIN:			return sizeof(PSPSTUBREQEXECBIN);
+	case PSP_STUB_SMN_READ:			return sizeof(PSPSTUBREQSMNRW);
+	case PSP_STUB_SMN_WRITE:			return sizeof(PSPSTUBREQSMNRW);
+	case PSP_STUB_PSP_READ:			return sizeof(PSPSTUBREQPSPRW);
+	case PSP_STUB_PSP_WRITE:			return sizeof(PSPSTUBREQPSPRW);
+	case PSP_STUB_CALL_SVC:			return sizeof(PSPSTUBREQCALLSVC);
+	case PSP_STUB_QUERY_INFO:			return sizeof(PSPSTUBREQQUERYINFO);
 	default:				return 0;
 	}
 
+	return 0;
+}
+
+static int __sev_emu_do_cmd_locked(struct psp_device *psp, int cmd, unsigned int phys_lsb, unsigned int phys_msb, int *psp_ret)
+{
+	int ret = 0;
+
+	while (atomic_read(&psp->sev_emu_wait_for_wrk) == 0)
+	{
+		ret = schedule_timeout_interruptible(msecs_to_jiffies(psp_cmd_timeout * 1000));
+		if (!ret)
+			return -ETIMEDOUT;
+	}
+
+	psp->cmd	  = cmd;
+	psp->phys_lsb = phys_lsb;
+	psp->phys_msb = phys_msb;
+	psp->ret      = 0;
+
+	psp->sev_emu_wrk_done  = 0;
+	psp->sev_emu_wrk_ready = 1;
+	wake_up(&psp->sev_emu_wrk_ready_queue);
+
+	ret = wait_event_interruptible_timeout(psp->sev_emu_wrk_done_queue, psp->sev_emu_wrk_done, msecs_to_jiffies(psp_cmd_timeout * 1000));
+	if (ret == -ERESTARTSYS)
+		return ret;
+	if (!ret)
+		return -ETIMEDOUT;
+
+	*psp_ret = psp->ret;
 	return 0;
 }
 
@@ -176,6 +223,11 @@ static int __sev_do_cmd_locked(int cmd, void *data, int *psp_ret)
 
 	print_hex_dump_debug("(in):  ", DUMP_PREFIX_OFFSET, 16, 2, data,
 			     sev_cmd_buffer_len(cmd), false);
+
+	if (   psp_emu_enabled
+		&& psp->emu_available
+		&& cmd < PSP_STUB_REQ_FIRST)
+		return __sev_emu_do_cmd_locked(psp_master, cmd, phys_lsb, phys_msb, psp_ret);
 
 	iowrite32(phys_lsb, psp->io_regs + psp->vdata->cmdbuff_addr_lo_reg);
 	iowrite32(phys_msb, psp->io_regs + psp->vdata->cmdbuff_addr_hi_reg);
@@ -220,9 +272,9 @@ static int sev_do_cmd(int cmd, void *data, int *psp_ret)
 {
 	int rc;
 
-	mutex_lock(&sev_cmd_mutex);
+	//mutex_lock(&sev_cmd_mutex);
 	rc = __sev_do_cmd_locked(cmd, data, psp_ret);
-	mutex_unlock(&sev_cmd_mutex);
+	//mutex_unlock(&sev_cmd_mutex);
 
 	return rc;
 }
@@ -248,7 +300,7 @@ static int __sev_platform_init_locked(int *error)
 		tmr_pa = __pa(sev_es_tmr);
 		tmr_pa = ALIGN(tmr_pa, SEV_ES_TMR_ALIGN);
 
-		psp->init_cmd_buf.flags |= SEV_INIT_FLAGS_SEV_ES;
+		psp->init_cmd_buf.flags |= 1/*SEV_INIT_FLAGS_SEV_ES*/;
 		psp->init_cmd_buf.tmr_address = tmr_pa;
 		psp->init_cmd_buf.tmr_len = SEV_ES_TMR_SIZE;
 	}
@@ -256,7 +308,17 @@ static int __sev_platform_init_locked(int *error)
 	if (rc)
 		return rc;
 
-	psp->sev_state = SEV_STATE_INIT;
+	rc = __sev_do_cmd_locked(PSP_STUB_QUERY_INFO, &psp->query_info_cmd_buf, error);
+	if (rc)
+		dev_info(psp->dev, "Failed to query BinLoader info rc=%d\n", rc);
+	else
+		dev_info(psp->dev, "Queried BinLoader information: PspScratchAddr=%#x cbScratch=%#x\n",
+			 psp->query_info_cmd_buf.u32PspScratchAddr, psp->query_info_cmd_buf.cbScratch);
+
+	if (psp_emu_enabled)
+		psp->sev_state = SEV_STATE_UNINIT;
+	else
+		psp->sev_state = SEV_STATE_INIT;
 	dev_dbg(psp->dev, "SEV firmware initialized\n");
 
 	return rc;
@@ -741,6 +803,417 @@ e_free:
 	return ret;
 }
 
+static int sev_ioctl_do_psp_rw(struct sev_issue_cmd *argp, int read)
+{
+	PPSPSTUBREQPSPRW psp_cmd;
+	void *blob = NULL;
+	struct sev_user_data_psp_stub_psp_rw input;
+	int ret;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	/* cmd buffer send to the SEV FW */
+	psp_cmd = kzalloc(sizeof(*psp_cmd), GFP_KERNEL);
+	if (!psp_cmd)
+		return -ENOMEM;
+
+	if (!access_ok(input.buf, input.size)) {
+		ret = -EFAULT;
+		goto e_free;
+	}
+
+	/* allocate a physically contiguous buffer to store the data transferred from the user */
+	blob = kzalloc(input.size, GFP_KERNEL);
+	if (!blob) {
+		ret = -ENOMEM;
+		goto e_free;
+	}
+
+	/* Copy the data from userspace to our local buffer */
+	if(copy_from_user(blob, (void __user*)input.buf, input.size))
+		return -EFAULT;
+
+	psp_cmd->Hdr.idCcd	= input.ccd_id;
+	psp_cmd->Hdr.i32Sts	= 0;
+	psp_cmd->u32Addr		= input.psp_addr;
+	psp_cmd->PhysX86Addr	= __pa(blob);
+	psp_cmd->cbCopy		= input.size;
+
+	ret = __sev_do_cmd_locked(read == 1 ? PSP_STUB_PSP_READ : PSP_STUB_PSP_WRITE, psp_cmd, &argp->error);
+	if (   !ret
+		&& read)
+	{
+		if (copy_to_user((void __user *)input.buf, blob, input.size))
+			ret = -EFAULT;
+	}
+	input.status = psp_cmd->Hdr.i32Sts;
+
+	if (copy_to_user((void __user *)argp->data, &input, sizeof(input))) {
+		ret = -EFAULT;
+		goto e_free_blob;
+	}
+
+e_free_blob:
+	kfree(blob);
+e_free:
+	kfree(psp_cmd);
+
+	if (!ret)
+	{
+		if (copy_to_user((void __user *)argp->data, &input, sizeof(input)))
+			ret = -EFAULT;
+	}
+
+	return ret;
+}
+
+static int sev_ioctl_do_smn_rw(struct sev_issue_cmd *argp, int read)
+{
+	PPSPSTUBREQSMNRW psp_cmd;
+	struct sev_user_data_psp_stub_smn_rw input;
+	int ret;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	/* cmd buffer send to the SEV FW */
+	psp_cmd = kzalloc(sizeof(*psp_cmd), GFP_KERNEL);
+	if (!psp_cmd)
+		return -ENOMEM;
+
+	psp_cmd->Hdr.idCcd	= input.ccd_id;
+	psp_cmd->Hdr.i32Sts	= 0;
+	psp_cmd->idCcdTgt	= input.ccd_id_tgt;
+	psp_cmd->u32Addr	= input.smn_addr;
+	psp_cmd->u64Val		= input.value;
+	psp_cmd->cbVal		= input.size;
+
+	ret = __sev_do_cmd_locked(read == 1 ? PSP_STUB_SMN_READ : PSP_STUB_SMN_WRITE, psp_cmd, &argp->error);
+	if (   !ret
+		&& read)
+		input.value = psp_cmd->u64Val;
+
+	input.status = psp_cmd->Hdr.i32Sts;
+
+	kfree(psp_cmd);
+
+	if (!ret)
+	{
+		if (copy_to_user((void __user *)argp->data, &input, sizeof(input)))
+			ret = -EFAULT;
+	}
+
+	return ret;
+}
+
+static int sev_ioctl_do_psp_x86_rw(struct sev_issue_cmd *argp, int read)
+{
+	PPSPSTUBREQPSPRW psp_cmd;
+	struct sev_user_data_psp_stub_psp_x86_rw input;
+	X86PADDR x86_src;
+	X86PADDR x86_dst;
+	void *blob = NULL;
+	size_t left;
+	int ret = 0;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	/* cmd buffer send to the SEV FW */
+	psp_cmd = kzalloc(sizeof(*psp_cmd), GFP_KERNEL);
+	if (!psp_cmd)
+		return -ENOMEM;
+
+	if (!access_ok(input.buf, input.size)) {
+		ret = -EFAULT;
+		goto e_free;
+	}
+
+	/* allocate a physically contiguous buffer to store the data transferred from the user */
+	blob = kzalloc(input.size, GFP_KERNEL);
+	if (!blob) {
+		ret = -ENOMEM;
+		goto e_free;
+	}
+
+	/* Copy the data from userspace to our local buffer */
+	if(copy_from_user(blob, (void __user*)input.buf, input.size))
+	{
+		ret = -EFAULT;
+		goto e_free_blob;
+	}
+
+	if (read)
+	{
+		x86_src = input.x86_phys;
+		x86_dst = __pa(blob);
+	}
+	else
+	{
+		x86_dst = input.x86_phys;
+		x86_src = __pa(blob);
+		if (copy_to_user((void __user *)input.buf, blob, input.size))
+		{
+			ret = -EFAULT;
+			goto e_free_blob;
+		}
+	}
+
+	left = input.size;
+
+	while (left)
+	{
+		u32 error = 0;
+		size_t this_xfer = left < psp_master->query_info_cmd_buf.cbScratch ? left : psp_master->query_info_cmd_buf.cbScratch;
+
+		/* Read data into PSP first. */
+		psp_cmd->Hdr.idCcd		= 0;
+		psp_cmd->Hdr.i32Sts		= 0;
+		psp_cmd->u32Addr		= psp_master->query_info_cmd_buf.u32PspScratchAddr;
+		psp_cmd->PhysX86Addr	= x86_src;
+		psp_cmd->cbCopy			= this_xfer;
+
+		ret = __sev_do_cmd_locked(PSP_STUB_PSP_WRITE, psp_cmd, &error);
+
+		/* Write data to x86 destination. */
+		psp_cmd->Hdr.idCcd		= 0;
+		psp_cmd->Hdr.i32Sts		= 0;
+		psp_cmd->u32Addr		= psp_master->query_info_cmd_buf.u32PspScratchAddr;
+		psp_cmd->PhysX86Addr	= x86_dst;
+		psp_cmd->cbCopy			= this_xfer;
+
+		ret = __sev_do_cmd_locked(PSP_STUB_PSP_READ, psp_cmd, &error);
+
+		x86_dst += this_xfer;
+		x86_src += this_xfer;
+		left    -= this_xfer;
+	}
+
+	if (   !ret
+		&& read)
+	{
+		if (copy_to_user((void __user *)input.buf, blob, input.size))
+			ret = -EFAULT;
+	}
+	input.status = psp_cmd->Hdr.i32Sts;
+
+e_free_blob:
+	kfree(blob);
+e_free:
+	kfree(psp_cmd);
+
+	if (!ret)
+	{
+		if (copy_to_user((void __user *)argp->data, &input, sizeof(input)))
+			ret = -EFAULT;
+	}
+
+	return ret;
+}
+
+static int sev_ioctl_do_svc_call(struct sev_issue_cmd *argp)
+{
+	PPSPSTUBREQCALLSVC psp_cmd;
+	struct sev_user_data_psp_stub_svc_call input;
+	int ret;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	/* cmd buffer send to the SEV FW */
+	psp_cmd = kzalloc(sizeof(*psp_cmd), GFP_KERNEL);
+	if (!psp_cmd)
+		return -ENOMEM;
+
+	psp_cmd->Hdr.idCcd	= input.ccd_id;
+	psp_cmd->Hdr.i32Sts	= 0;
+	psp_cmd->idxSyscall	= input.syscall;
+	psp_cmd->u32R0		= input.r0;
+	psp_cmd->u32R1		= input.r1;
+	psp_cmd->u32R2		= input.r2;
+	psp_cmd->u32R3		= input.r3;
+
+	ret = __sev_do_cmd_locked(PSP_STUB_CALL_SVC, psp_cmd, &argp->error);
+	input.r0_return = psp_cmd->u32R0Return;
+	input.status = psp_cmd->Hdr.i32Sts;
+
+	kfree(psp_cmd);
+
+	if (!ret)
+	{
+		if (copy_to_user((void __user *)argp->data, &input, sizeof(input)))
+			ret = -EFAULT;
+	}
+
+	return ret;
+}
+
+static int sev_ioctl_do_x86_smn_rw(struct sev_issue_cmd *argp, int read)
+{
+	struct sev_user_data_x86_smn_rw input;
+	int ret;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	if (read)
+		ret = amd_smn_read(input.node, input.addr, &input.value);
+	else
+		ret = amd_smn_write(input.node, input.addr, input.value);
+
+	if (!ret)
+	{
+		if (copy_to_user((void __user *)argp->data, &input, sizeof(input)))
+			ret = -EFAULT;
+	}
+
+	return ret;
+}
+
+static int sev_ioctl_do_x86_mem_alloc(struct sev_issue_cmd *argp)
+{
+	struct sev_user_data_x86_mem_alloc input;
+	int ret = 0;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	input.addr_virtual = (__u64)kmalloc(input.size, GFP_KERNEL);
+	input.addr_physical = __pa(input.addr_virtual);
+
+	if (input.addr_virtual != 0)
+	{
+		if (copy_to_user((void __user *)argp->data, &input, sizeof(input)))
+			ret = -EFAULT;
+	}
+	else
+		ret = -ENOMEM;
+
+	return ret;
+}
+
+static int sev_ioctl_do_x86_mem_free(struct sev_issue_cmd *argp)
+{
+	struct sev_user_data_x86_mem_free input;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	kfree((void *)input.addr_virtual);
+	return 0;
+}
+
+static int sev_ioctl_do_x86_mem_rw(struct sev_issue_cmd *argp, int read)
+{
+	struct sev_user_data_x86_mem_rw input;
+	int ret;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	if (read)
+		ret = copy_to_user((void __user *)input.user_buf, (void *)input.kern_buf, input.size);
+	else
+		ret = copy_from_user((void *)input.kern_buf, (void __user *)input.user_buf, input.size);
+
+	if (ret)
+		ret = -EFAULT;
+
+	return ret;
+}
+
+static int sev_ioctl_do_emu_wait_for_work(struct sev_issue_cmd *argp)
+{
+	int rc;
+	struct sev_user_data_emu_wait_for_work input;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	atomic_set(&psp_master->sev_emu_wait_for_wrk, 1);
+	rc = wait_event_interruptible_timeout(psp_master->sev_emu_wrk_ready_queue, psp_master->sev_emu_wrk_ready,
+											msecs_to_jiffies(input.timeout));
+	atomic_set(&psp_master->sev_emu_wait_for_wrk, 0);
+	if (rc == -ERESTARTSYS)
+		return rc;
+	if (!rc)
+		return -ETIMEDOUT;
+
+	psp_master->sev_emu_wrk_ready = 0;
+
+	input.cmd = psp_master->cmd;
+	input.phys_lsb = psp_master->phys_lsb;
+	input.phys_msb = psp_master->phys_msb;
+
+	if (copy_to_user((void __user *)argp->data, &input, sizeof(input)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int sev_ioctl_do_emu_set_result(struct sev_issue_cmd *argp)
+{
+	struct sev_user_data_emu_set_result input;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	psp_master->ret = input.result;
+	psp_master->sev_emu_wrk_done = 1;
+	wake_up(&psp_master->sev_emu_wrk_done_queue);
+	return 0;
+}
+
+int psp_write_protected_x86_memory_2_phys(u64 PhysX86Dst, u64 PhysX86Src, size_t cbWrite)
+{
+	size_t cbLeft;
+	int ret = 0;
+	PSPSTUBREQPSPRW *psp_cmd;
+
+	cbLeft = cbWrite;
+
+	/* cmd buffer send to the SEV FW */
+	psp_cmd = kzalloc(sizeof(*psp_cmd), GFP_KERNEL);
+	if (!psp_cmd)
+		return -ENOMEM;
+
+	while (cbLeft)
+	{
+		u32 error = 0;
+		size_t cbThisXfer = cbLeft < 4096 ? cbLeft : 4096;
+
+		/* Read data into PSP first. */
+		psp_cmd->Hdr.idCcd		= 0;
+		psp_cmd->Hdr.i32Sts		= 0;
+		psp_cmd->u32Addr		= psp_master->query_info_cmd_buf.u32PspScratchAddr ;
+		psp_cmd->PhysX86Addr		= PhysX86Src;
+		psp_cmd->cbCopy			= cbThisXfer;
+
+		ret = __sev_do_cmd_locked(PSP_STUB_PSP_WRITE, &psp_cmd, &error);
+
+		/* Write data to protected destination. */
+		psp_cmd->Hdr.idCcd		= 0;
+		psp_cmd->Hdr.i32Sts		= 0;
+		psp_cmd->u32Addr		= psp_master->query_info_cmd_buf.u32PspScratchAddr;
+		psp_cmd->PhysX86Addr		= PhysX86Dst;
+		psp_cmd->cbCopy			= cbThisXfer;
+
+		ret = __sev_do_cmd_locked(PSP_STUB_PSP_READ, &psp_cmd, &error);
+
+		PhysX86Dst += cbThisXfer;
+		PhysX86Src += cbThisXfer;
+		cbLeft     -= cbThisXfer;
+	}
+
+	kfree(psp_cmd);
+
+	printk("ret=%u\n", ret);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(psp_write_protected_x86_memory_2_phys);
+
+
 static long sev_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 {
 	void __user *argp = (void __user *)arg;
@@ -759,7 +1232,7 @@ static long sev_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 	if (input.cmd > SEV_MAX)
 		return -EINVAL;
 
-	mutex_lock(&sev_cmd_mutex);
+	//mutex_lock(&sev_cmd_mutex);
 
 	switch (input.cmd) {
 
@@ -787,6 +1260,56 @@ static long sev_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 	case SEV_GET_ID:
 		ret = sev_ioctl_do_get_id(&input);
 		break;
+
+	case SEV_PSP_STUB_LOAD_BIN:
+	case SEV_PSP_STUB_EXEC_BIN:
+		ret = -EINVAL;
+		goto out;
+	case SEV_PSP_STUB_SMN_READ:
+		ret = sev_ioctl_do_smn_rw(&input, 1);
+		break;
+	case SEV_PSP_STUB_SMN_WRITE:
+		ret = sev_ioctl_do_smn_rw(&input, 0);
+		break;
+	case SEV_PSP_STUB_PSP_READ:
+		ret = sev_ioctl_do_psp_rw(&input, 1);
+		break;
+	case SEV_PSP_STUB_PSP_WRITE:
+		ret = sev_ioctl_do_psp_rw(&input, 0);
+		break;
+	case SEV_PSP_STUB_PSP_X86_READ:
+		ret = sev_ioctl_do_psp_x86_rw(&input, 1);
+		break;
+	case SEV_PSP_STUB_PSP_X86_WRITE:
+		ret = sev_ioctl_do_psp_x86_rw(&input, 0);
+		break;
+	case SEV_PSP_STUB_CALL_SVC:
+		ret = sev_ioctl_do_svc_call(&input);
+		goto out;
+	case SEV_X86_SMN_READ:
+		ret = sev_ioctl_do_x86_smn_rw(&input, 1);
+		break;
+	case SEV_X86_SMN_WRITE:
+		ret = sev_ioctl_do_x86_smn_rw(&input, 0);
+		break;
+	case SEV_X86_MEM_ALLOC:
+		ret = sev_ioctl_do_x86_mem_alloc(&input);
+		break;
+	case SEV_X86_MEM_FREE:
+		ret = sev_ioctl_do_x86_mem_free(&input);
+		break;
+	case SEV_X86_MEM_READ:
+		ret = sev_ioctl_do_x86_mem_rw(&input, 1);
+		break;
+	case SEV_X86_MEM_WRITE:
+		ret = sev_ioctl_do_x86_mem_rw(&input, 0);
+		break;
+	case SEV_EMU_WAIT_FOR_WORK:
+		ret = sev_ioctl_do_emu_wait_for_work(&input);
+		break;
+	case SEV_EMU_SET_RESULT:
+		ret = sev_ioctl_do_emu_set_result(&input);
+		break;
 	default:
 		ret = -EINVAL;
 		goto out;
@@ -795,7 +1318,7 @@ static long sev_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 	if (copy_to_user(argp, &input, sizeof(struct sev_issue_cmd)))
 		ret = -EFAULT;
 out:
-	mutex_unlock(&sev_cmd_mutex);
+	//mutex_unlock(&sev_cmd_mutex);
 
 	return ret;
 }
@@ -876,6 +1399,10 @@ static int sev_misc_init(struct psp_device *psp)
 	}
 
 	init_waitqueue_head(&psp->sev_int_queue);
+	init_waitqueue_head(&psp->sev_emu_wrk_ready_queue);
+	init_waitqueue_head(&psp->sev_emu_wrk_done_queue);
+	atomic_set(&psp->sev_emu_wait_for_wrk, 0);
+	psp->emu_available = 1;
 	psp->sev_misc = misc_dev;
 	dev_dbg(dev, "registered SEV device\n");
 
@@ -992,6 +1519,7 @@ void psp_pci_init(void)
 		return;
 
 	psp_master = sp->psp_data;
+	psp_master->emu_available = 0;
 
 	psp_timeout = psp_probe_timeout;
 
@@ -1018,7 +1546,8 @@ void psp_pci_init(void)
 		sev_get_api_version();
 
 	/* Obtain the TMR memory area for SEV-ES use */
-	if (boot_cpu_has(X86_FEATURE_SEV_ES)) {
+	if (   boot_cpu_has(X86_FEATURE_SEV_ES)
+		|| psp_emu_enabled) {
 		sev_es_tmr = kzalloc(SEV_ES_TMR_LEN, GFP_KERNEL);
 		if (!sev_es_tmr)
 			goto out;
@@ -1033,6 +1562,7 @@ void psp_pci_init(void)
 
 	dev_info(sp->dev, "SEV API:%d.%d build:%d\n", psp_master->api_major,
 		 psp_master->api_minor, psp_master->build);
+	psp_master->emu_available = 1;
 
 	return;
 

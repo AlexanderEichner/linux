@@ -1,13 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * AMD Platform Security Processor (PSP) interface driver
  *
  * Copyright (C) 2017-2018 Advanced Micro Devices, Inc.
  *
  * Author: Brijesh Singh <brijesh.singh@amd.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 #ifndef __PSP_DEV_H__
@@ -27,6 +24,10 @@
 #include <linux/dmaengine.h>
 #include <linux/psp-sev.h>
 #include <linux/miscdevice.h>
+#include <linux/atomic.h>
+
+#define IN_LINUX
+#include <linux/psp-stub.h>
 
 #include "sp-dev.h"
 
@@ -61,6 +62,20 @@ struct psp_device {
 	struct sev_misc_dev *sev_misc;
 	struct sev_user_data_status status_cmd_buf;
 	struct sev_data_init init_cmd_buf;
+
+	PSPSTUBREQQUERYINFO query_info_cmd_buf;
+	atomic_t sev_emu_wait_for_wrk;
+	unsigned int sev_emu_wrk_ready;
+	wait_queue_head_t sev_emu_wrk_ready_queue;
+
+	unsigned int sev_emu_wrk_done;
+	wait_queue_head_t sev_emu_wrk_done_queue;
+	int emu_available;
+
+	u32 cmd;
+	u32 phys_lsb;
+	u32 phys_msb;
+	int ret;
 
 	u8 api_major;
 	u8 api_minor;
