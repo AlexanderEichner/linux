@@ -1049,6 +1049,39 @@ static int sev_ioctl_do_svc_call(struct sev_issue_cmd *argp)
 	return ret;
 }
 
+static int sev_ioctl_do_query_info(struct sev_issue_cmd *argp)
+{
+	PPSPSTUBREQQUERYINFO psp_cmd;
+	struct sev_user_data_query_info input;
+	int ret;
+
+	if (copy_from_user(&input, (void __user *)argp->data, sizeof(input)))
+		return -EFAULT;
+
+	/* cmd buffer send to the SEV FW */
+	psp_cmd = kzalloc(sizeof(*psp_cmd), GFP_KERNEL);
+	if (!psp_cmd)
+		return -ENOMEM;
+
+	psp_cmd->Hdr.idCcd	= input.ccd_id;
+	psp_cmd->Hdr.i32Sts	= 0;
+
+	ret = __sev_do_cmd_locked(PSP_STUB_QUERY_INFO, psp_cmd, &argp->error);
+	input.status = psp_cmd->Hdr.i32Sts;
+	input.psp_addr_scratch_start = psp_cmd->u32PspScratchAddr;
+	input.scratch_size = psp_cmd->cbScratch;
+
+	kfree(psp_cmd);
+
+	if (!ret)
+	{
+		if (copy_to_user((void __user *)argp->data, &input, sizeof(input)))
+			ret = -EFAULT;
+	}
+
+	return ret;
+}
+
 static int sev_ioctl_do_x86_smn_rw(struct sev_issue_cmd *argp, int read)
 {
 	struct sev_user_data_x86_smn_rw input;
@@ -1285,6 +1318,9 @@ static long sev_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 		break;
 	case SEV_PSP_STUB_CALL_SVC:
 		ret = sev_ioctl_do_svc_call(&input);
+		goto out;
+	case SEV_PSP_STUB_QUERY_INFO:
+		ret = sev_ioctl_do_query_info(&input);
 		goto out;
 	case SEV_X86_SMN_READ:
 		ret = sev_ioctl_do_x86_smn_rw(&input, 1);
